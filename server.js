@@ -24,6 +24,10 @@ const DB_CONFIG = {
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
+
+     ssl: {
+    rejectUnauthorized: true,
+  },
 };
 
 /* ======================
@@ -161,3 +165,4 @@ app.post("/api/auth/login", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
