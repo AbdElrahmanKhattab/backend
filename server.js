@@ -10,12 +10,24 @@ const app = express();
    CONFIG
 ====================== */
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
 
-/*
-  IMPORTANT:
-  These MUST be set in Back4App → Environment Variables
-*/
+/* ======================
+   MIDDLEWARE
+====================== */
+app.use(cors());
+app.use(express.json());
+
+/* ======================
+   HEALTH CHECK (REQUIRED)
+====================== */
+app.get("/", (req, res) => {
+  res.json({ status: "OK" });
+});
+
+/* ======================
+   DATABASE CONFIG (AIVEN)
+====================== */
 const DB_CONFIG = {
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 26324),
@@ -28,33 +40,19 @@ const DB_CONFIG = {
   queueLimit: 0,
 
   ssl: {
-    rejectUnauthorized: false,
+    rejectUnauthorized: false, // REQUIRED for Aiven
   },
 };
 
-
-/* ======================
-   MIDDLEWARE
-====================== */
-app.use(cors());
-app.use(express.json());
-
-/* ======================
-   HEALTH CHECK (MANDATORY)
-====================== */
-app.get("/", (req, res) => {
-  res.status(200).json({ status: "OK" });
-});
-
-/* ======================
-   DATABASE (NON-BLOCKING)
-====================== */
 let pool = null;
 
+/* ======================
+   NON-BLOCKING DB INIT
+====================== */
 async function connectDatabase() {
   try {
     if (!DB_CONFIG.host) {
-      console.warn("⚠️ DB env vars not set. Running without DB.");
+      console.warn("⚠️ DB env vars missing. Running without DB.");
       return;
     }
 
@@ -67,8 +65,44 @@ async function connectDatabase() {
   }
 }
 
-// Connect AFTER server starts
 connectDatabase();
+
+/* ======================
+   SQLITE-COMPAT DB API
+====================== */
+const db = {
+  run(sql, params = [], cb) {
+    pool.query(sql, params)
+      .then(([res]) => cb && cb.call({ lastID: res.insertId, changes: res.affectedRows }, null))
+      .catch(err => cb && cb(err));
+  },
+
+  get(sql, params = [], cb) {
+    pool.query(sql, params)
+      .then(([rows]) => cb(null, rows[0]))
+      .catch(err => cb(err));
+  },
+
+  all(sql, params = [], cb) {
+    pool.query(sql, params)
+      .then(([rows]) => cb(null, rows))
+      .catch(err => cb(err));
+  },
+
+  prepare(sql) {
+    return {
+      run: (...args) => {
+        const cb = typeof args.at(-1) === "function" ? args.pop() : null;
+        pool.query(sql, args).then(() => cb && cb()).catch(err => cb && cb(err));
+      },
+      finalize() {}
+    };
+  },
+
+  serialize(fn) {
+    fn && fn();
+  }
+};
 
 /* ======================
    AUTH MIDDLEWARE
@@ -89,466 +123,74 @@ function authMiddleware(requiredRole) {
       req.user = payload;
       next();
     } catch {
-      return res.status(401).json({ message: "Invalid token" });
+      res.status(401).json({ message: "Invalid token" });
     }
   };
 }
 
 /* ======================
-  new
+   AUTH ROUTES
 ====================== */
+app.post("/api/auth/register", (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
 
- DB Compatibility Wrapper (for existing code that uses db.run/get/all)
-const db = {
-  run: function (sql, params, callback) {
-    if (typeof params === 'function') {
-      callback = params;
-      params = [];
-    }
-    pool.query(sql, params, function (err, results) {
-      if (callback) {
-        const context = {
-          lastID: results ? results.insertId : 0,
-          changes: results ? results.affectedRows : 0
-        };
-        callback.call(context, err);
-      }
-    });
-  },
-  get: function (sql, params, callback) {
-    if (typeof params === 'function') {
-      callback = params;
-      params = [];
-    }
-    pool.query(sql, params, function (err, results) {
-      if (err) return callback(err);
-      callback(null, results && results.length > 0 ? results[0] : undefined);
-    });
-  },
-  all: function (sql, params, callback) {
-    if (typeof params === 'function') {
-      callback = params;
-      params = [];
-    }
-    pool.query(sql, params, function (err, results) {
-      callback(err, results);
-    });
-  },
-  serialize: function (callback) {
-    if (callback) callback();
-  },
-  prepare: function (sql) {
-    return {
-      run: function (...args) {
-        const callback = args.length > 0 && typeof args[args.length - 1] === 'function' ? args.pop() : null;
-        pool.query(sql, args, function (err, results) {
-          if (callback) callback(err);
-        });
-      },
-      finalize: function () { }
-    };
-  }
-};
-
-// Promisified helper for migrations
-const queryAsync = (sql, params = []) => {
-  return new Promise((resolve, reject) => {
-    pool.query(sql, params, (err, res) => {
-      if (err) reject(err);
-      else resolve(res);
-    });
-  });
-};
-
-async function runMigrationsAsync() {
-  try {
-    // 1. Create Tables
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS categories (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        name VARCHAR(100) UNIQUE NOT NULL,
-        icon VARCHAR(50),
-        description TEXT,
-        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        passwordHash TEXT NOT NULL,
-        name VARCHAR(255),
-        profileImage LONGTEXT,
-        role VARCHAR(50) NOT NULL CHECK(role IN ('student', 'admin')),
-        membershipType VARCHAR(50) DEFAULT 'free',
-        membershipExpiresAt TEXT,
-        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS cases (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        title TEXT NOT NULL,
-        specialty TEXT,
-        category TEXT,
-        categoryId INT,
-        difficulty TEXT,
-        isLocked BOOLEAN NOT NULL DEFAULT 0,
-        prerequisiteCaseId INT,
-        metadata TEXT,
-        thumbnailUrl LONGTEXT,
-        duration INT,
-        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(categoryId) REFERENCES categories(id) ON DELETE SET NULL
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS case_steps (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        caseId INT NOT NULL,
-        stepIndex INT NOT NULL,
-        type VARCHAR(50) NOT NULL,
-        content LONGTEXT NOT NULL,
-        question TEXT,
-        explanationOnFail TEXT,
-        maxScore INT DEFAULT 0,
-        FOREIGN KEY(caseId) REFERENCES cases(id) ON DELETE CASCADE
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS case_step_options (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        stepId INT NOT NULL,
-        label TEXT NOT NULL,
-        isCorrect BOOLEAN NOT NULL DEFAULT 0,
-        feedback TEXT,
-        FOREIGN KEY(stepId) REFERENCES case_steps(id) ON DELETE CASCADE
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS investigations (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        stepId INT NOT NULL,
-        groupLabel TEXT NOT NULL,
-        testName TEXT NOT NULL,
-        description TEXT,
-        result TEXT,
-        videoUrl TEXT,
-        FOREIGN KEY(stepId) REFERENCES case_steps(id) ON DELETE CASCADE
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS xrays (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        stepId INT NOT NULL,
-        label TEXT NOT NULL,
-        icon TEXT,
-        imageUrl LONGTEXT,
-        FOREIGN KEY(stepId) REFERENCES case_steps(id) ON DELETE CASCADE
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS progress (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        userId INT NOT NULL,
-        caseId INT NOT NULL,
-        score INT NOT NULL,
-        isCompleted BOOLEAN NOT NULL DEFAULT 0,
-        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE,
-        FOREIGN KEY(caseId) REFERENCES cases(id) ON DELETE CASCADE
-      )
-    `);
-
-    await queryAsync(`
-      CREATE TABLE IF NOT EXISTS website_content (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        page VARCHAR(100) NOT NULL,
-        section VARCHAR(100) NOT NULL,
-        content TEXT NOT NULL,
-        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE(page, section)
-      )
-    `);
-
-    // 2. Initial Seeding (Admin & Case & Categories)
-    // Check Admin
-    const adminRows = await queryAsync(`SELECT COUNT(*) as count FROM users WHERE role='admin'`);
-    if (adminRows[0].count === 0) {
-      const passwordHash = bcrypt.hashSync('admin123', 10);
-      await queryAsync(
-        `INSERT INTO users (email, passwordHash, role) VALUES (?, ?, 'admin')`,
-        ['admin@example.com', passwordHash]
-      );
-      console.log('Seeded default admin: admin@example.com / admin123');
-    }
-
-    // Seed Categories
-    const catRows = await queryAsync(`SELECT COUNT(*) as count FROM categories`);
-    if (catRows[0].count === 0) {
-      const defaultCats = [
-        { name: 'Knee', icon: '🦵' },
-        { name: 'Back', icon: '🦴' },
-        { name: 'Shoulder', icon: '💪' },
-        { name: 'Hip', icon: '🦴' },
-        { name: 'Ankle', icon: '🦶' },
-        { name: 'Other', icon: '📋' }
-      ];
-      for (const cat of defaultCats) {
-        await queryAsync(`INSERT INTO categories (name, icon) VALUES (?, ?)`, [cat.name, cat.icon]);
-      }
-      console.log('Seeded default categories');
-    }
-
-    // Check Case
-    const caseRows = await queryAsync(`SELECT COUNT(*) as count FROM cases`);
-    if (caseRows[0].count === 0) {
-      seedInitialCase();
-    }
-
-    // 3. Alter Migrations (Check and Add Column)
-    // Helper
-    const ensureColumn = async (table, column, def) => {
-      const rows = await queryAsync(`SHOW COLUMNS FROM ${table} LIKE '${column}'`);
-      if (rows.length === 0) {
-        await queryAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${def}`);
-        console.log(`Added column ${column} to ${table}`);
-      }
-    };
-
-    await ensureColumn('xrays', 'imageUrl', 'LONGTEXT');
-    await ensureColumn('cases', 'thumbnailUrl', 'LONGTEXT');
-    await ensureColumn('cases', 'duration', 'INT DEFAULT 10');
-    await ensureColumn('cases', 'category', 'TEXT');
-    await ensureColumn('cases', 'categoryId', 'INT');
-    await ensureColumn('users', 'name', 'VARCHAR(255)');
-    await ensureColumn('users', 'profileImage', 'LONGTEXT');
-    await ensureColumn('users', 'membershipType', "VARCHAR(50) DEFAULT 'free'");
-    await ensureColumn('users', 'membershipExpiresAt', 'TEXT');
-    await ensureColumn('users', 'createdAt', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
-
-    // Migrate existing string categories to categoryId
-    try {
-      await queryAsync(`
-        UPDATE cases c 
-        JOIN categories cat ON c.category = cat.name 
-        SET c.categoryId = cat.id 
-        WHERE c.categoryId IS NULL AND c.category IS NOT NULL
-      `);
-      // console.log('Migrated existing categories to categoryId');
-    } catch (e) {
-      // Ignore if fails (e.g. table doesn't exist yet in weird state)
-    }
-
-    // 4. Upgrade Columns to LONGTEXT (Explicit migration for existing tables)
-    try {
-      await queryAsync(`ALTER TABLE cases MODIFY COLUMN thumbnailUrl LONGTEXT`);
-      await queryAsync(`ALTER TABLE case_steps MODIFY COLUMN content LONGTEXT`);
-      await queryAsync(`ALTER TABLE xrays MODIFY COLUMN imageUrl LONGTEXT`);
-      console.log('Upgraded columns to LONGTEXT');
-    } catch (e) {
-      console.log('Column upgrade error (might already be upgraded):', e.message);
-    }
-
-  } catch (err) {
-    console.error('Migration Error:', err);
-  }
-}
-
-function seedInitialCase() {
-  db.serialize(() => {
-    db.get(`SELECT id FROM categories WHERE name = 'Knee'`, [], (err, catRow) => {
-      const categoryId = catRow ? catRow.id : null;
-      db.run(
-        `INSERT INTO cases (title, specialty, difficulty, isLocked, metadata, category, categoryId)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          '54-year-old female with knee pain',
-          'Physical Therapy',
-          'Intermediate',
-          0,
-          JSON.stringify({
-            brief:
-              '54-year-old female with chronic knee pain, worse on stairs and during prayer on the floor.',
-          }),
-          'Knee',
-          categoryId
-        ],
-        function (err) {
-          if (err) return console.error(err);
-          const caseId = this.lastID;
-
-          db.run(
-            `INSERT INTO case_steps
-             (caseId, stepIndex, type, content, question, explanationOnFail, maxScore)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-              caseId,
-              0,
-              'info',
-              JSON.stringify({
-                patientName: 'Ms. A',
-                age: 54,
-                gender: 'Female',
-                imageUrl: null,
-                description:
-                  'I have had knee pain for a few months. The pain is worse when I go up and down stairs. At first it felt better after moving, but now it is there all the time and makes it difficult to pray on the floor.',
-                chiefComplaint:
-                  'طلوع ونزل السلم بيتعبوني ودلوقتي بقيت اصلي على كرسي علشان مبقتش اعرف اسجد',
-              }),
-              null,
-              null,
-              0,
-            ]
-          );
-
-          db.run(
-            `INSERT INTO case_steps
-             (caseId, stepIndex, type, content, question, explanationOnFail, maxScore)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-              caseId,
-              1,
-              'mcq',
-              JSON.stringify({
-                prompt:
-                  'What is the MOST appropriate next action after hearing this chief complaint?',
-              }),
-              'Choose the best next step in managing this patient.',
-              'Incorrect. Remember that the first priority is to take a focused history before jumping to investigations or treatment.',
-              10,
-            ],
-            function (err2) {
-              if (err2) return console.error(err2);
-              const stepId = this.lastID;
-              const options = [
-                {
-                  label: 'Order MRI of the knee immediately',
-                  isCorrect: 0,
-                  feedback:
-                    'Jumping to advanced imaging without a proper history and examination is not appropriate as a first step.',
-                },
-                {
-                  label: 'Start the patient on strong analgesics and send her home',
-                  isCorrect: 0,
-                  feedback:
-                    'Symptomatic treatment alone without understanding the cause and functional limitations is not adequate.',
-                },
-                {
-                  label: 'Begin quadriceps strengthening exercises right away',
-                  isCorrect: 0,
-                  feedback:
-                    'Exercise may be part of management but should follow a complete assessment, not precede it.',
-                },
-                {
-                  label: 'Take a detailed history of the knee pain and functional limitations',
-                  isCorrect: 1,
-                  feedback:
-                    'Correct. A structured, detailed history is the essential next step.',
-                },
-              ];
-              const stmt = db.prepare(
-                `INSERT INTO case_step_options (stepId, label, isCorrect, feedback)
-                 VALUES (?, ?, ?, ?)`
-              );
-              options.forEach((opt) => {
-                stmt.run(stepId, opt.label, opt.isCorrect, opt.feedback);
-              });
-              stmt.finalize();
-            }
-          );
-        }
-      );
-    });
-  });
-}
-
-function authMiddleware(requiredRole) {
-  return (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ message: 'Missing token' });
-    const token = authHeader.split(' ')[1];
-    try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      if (requiredRole && payload.role !== requiredRole) {
-        return res.status(403).json({ message: 'Forbidden' });
-      }
-      req.user = payload;
-      next();
-    } catch (e) {
-      return res.status(401).json({ message: 'Invalid token' });
-    }
-  };
-}
-
-app.post('/api/auth/register', (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
-    return res.status(400).json({ message: 'Email and password are required' });
+    return res.status(400).json({ message: "Email and password required" });
   }
-  const passwordHash = bcrypt.hashSync(password, 10);
-  const role = 'student';
+
+  const hash = bcrypt.hashSync(password, 10);
+
   db.run(
-    `INSERT INTO users (email, passwordHash, role) VALUES (?, ?, ?)`,
-    [email, passwordHash, role],
+    `INSERT INTO users (email, passwordHash, role) VALUES (?, ?, 'student')`,
+    [email, hash],
     function (err) {
       if (err) {
-        if (err.code === 'ER_DUP_ENTRY') {
-          return res.status(409).json({ message: 'Email already exists' });
+        if (err.code === "ER_DUP_ENTRY") {
+          return res.status(409).json({ message: "Email already exists" });
         }
-        console.error(err);
-        return res.status(500).json({ message: 'Error creating user' });
+        return res.status(500).json({ message: "Registration failed" });
       }
+
       const token = jwt.sign(
-        { id: this.lastID, email, role },
+        { id: this.lastID, email, role: "student" },
         JWT_SECRET,
-        { expiresIn: '7d' }
+        { expiresIn: "7d" }
       );
-      res.json({ token, user: { id: this.lastID, email, role, name: null, profileImage: null } });
+
+      res.json({ token });
     }
   );
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post("/api/auth/login", (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
+
   const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ message: 'Email and password are required' });
-  }
-  db.get(
-    `SELECT * FROM users WHERE email = ?`,
-    [email],
-    (err, user) => {
-      if (err) return res.status(500).json({ message: 'Database error' });
-      if (!user) return res.status(401).json({ message: 'Invalid credentials' });
-      const match = bcrypt.compareSync(password, user.passwordHash);
-      if (!match) {
-        return res.status(401).json({ message: 'Invalid credentials' });
-      }
-      const token = jwt.sign(
-        { id: user.id, email: user.email, role: user.role },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-      res.json({
-        token,
-        user: {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-          name: user.name,
-          profileImage: user.profileImage
-        },
-      });
+
+  db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
+    if (err || !user) {
+      return res.status(401).json({ message: "Invalid credentials" });
     }
-  );
+
+    if (!bcrypt.compareSync(password, user.passwordHash)) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({ token, user });
+  });
 });
+
+/* ======================
+   🔥 ALL YOUR OTHER ROUTES GO HERE
+   (PASTE THEM EXACTLY AS THEY ARE)
+====================== */
 
 app.get('/api/me', authMiddleware(), (req, res) => {
   db.get(
@@ -1224,16 +866,10 @@ app.delete('/api/admin/categories/:id', authMiddleware('admin'), (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend API running on http://localhost:${PORT}`);
-});
 
 /* ======================
-   SERVER START (CRITICAL)
+   SERVER START
 ====================== */
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Backend running on port ${PORT}`);
 });
-
-
-
